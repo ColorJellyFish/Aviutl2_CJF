@@ -1,0 +1,73 @@
+--label:CJF
+--information:改変用ベース: PSDToolKit linkage base (copy & extend) / AviUtl2 only
+--track@refLayer:参照レイヤー,1,100,1,1
+--value@charId:キャラクターID,""
+--value@watchParts:監視パーツ,""
+--value@overwriteEffect:上書き効果名,""
+--track@gateDur:境界時間(秒),0.05,2,0.4,0.01
+
+-- 改変用ベース
+-- Copy this file, rename, append animation below using `gates` / `t` / `remain`.
+-- Required in Script/: this anm2, ptk_overwrite_react_core.lua, ptk_overwrite_react_state.lua
+-- Attach to PSDファイル@PSDToolKit (not the overwrite object).
+--
+-- Same pipeline as くるっと@psd:
+--   Core.update -> read_sub_clock -> clip_flip_gates
+-- Basic ops: gapless overwrite on refLayer; prefer charId.
+-- watchParts empty/all = flip every boundary; "4,5" = only when those parts change.
+-- open  = react.changed or bank previous clip
+-- close = part_bank next clip (peek only on miss)
+-- Prefer obj.sx/sy card-flip (not obj.ry) so it works under グループ制御.
+
+local gate_dur = tonumber(gateDur) or 0.4
+if gate_dur < 0.05 then gate_dur = 0.05 end
+local half = gate_dur * 0.5
+
+local Core = require("ptk_overwrite_react_core")
+local react = Core.update({
+	ref_layer = refLayer,
+	char_id = charId,
+	watch_parts = watchParts,
+	overwrite_effect = overwriteEffect,
+	pre_roll = 0,
+})
+
+if not react.found then
+	return
+end
+
+local t, tt, remain, src = Core.read_sub_clock(react.ref_layer, react.char_id)
+if t == nil or remain == nil then
+	return
+end
+
+local gates = Core.clip_flip_gates({
+	react = react,
+	watch_parts = watchParts,
+	peek_layer = refLayer,
+	time = t,
+	remain = remain,
+	totaltime = tt,
+	open_half = half,
+	close_half = half,
+})
+
+------------------------------------------------------------
+-- APPEND ANIMATION BELOW
+-- Available:
+--   react  : Core.update result (found, changed, values, diff, ...)
+--   t, tt, remain, src : overwrite clip clock (SubObjectStates)
+--   half   : gateDur / 2
+--   gates  : { open, close, reason, watch_label, watch_all, peek_layer }
+--
+-- Example (same idea as くるっと@psd; replace with your motion):
+--   if gates.open then
+--     local p = (half > 0) and (t / half) or 1
+--     local deg = 270.0 + 90.0 * p
+--     obj.sx = obj.sx * math.max(0, math.cos(math.rad(deg)))
+--   elseif gates.close then
+--     local p = (half > 0) and (1 - remain / half) or 1
+--     local deg = 90.0 * p
+--     obj.sx = obj.sx * math.max(0, math.cos(math.rad(deg)))
+--   end
+------------------------------------------------------------
