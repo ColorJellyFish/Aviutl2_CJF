@@ -54,6 +54,24 @@ static void reset_pick_checkbox();  // 前方宣言 (begin_range_select の失�
 static HWND panel_window = nullptr;
 static const wchar_t panel_class_name[] = L"CJFPreviewRangePanel";
 #define IDC_RANGE_BUTTON 2001
+#define IDC_PEN_BUTTON 2002
+static const char range_object_alias[] = u8R"([Object]
+[Object.0]
+effect.name=図形ツール
+図形=1
+幅(px)=200
+高さ(px)=200
+線幅(px)=10
+塗りつぶし=1
+色=ffffff
+プレビューから範囲指定=0
+[Object.1]
+effect.name=標準描画
+X=0.00
+Y=0.00
+)";
+static constexpr wchar_t pen_frame_class_name[] = L"CJFPreviewPenFrame";
+static constexpr wchar_t pen_panel_message_name[] = L"CJF.PreviewRangeSelector.Panel.Pen";
 
 // チェックボタン式起動 (Phase 5): 設定ウィンドウの「プレビューから範囲指定」チェックを
 // ポーリングで検知する。200ms ごとに選択中オブジェクトのチェックを読み、ON なら起動。
@@ -65,6 +83,10 @@ static bool polling_in_progress = false;
 static DWORD polling_backoff_until = 0;
 #define CONFIG_CHECKBOX_ID 3001
 static HWND config_window = nullptr;
+static constexpr COLORREF CJF_UI_BG = RGB(0x20, 0x20, 0x20);
+static constexpr COLORREF CJF_UI_BUTTON = RGB(0x2a, 0x2a, 0x2a);
+static constexpr COLORREF CJF_UI_BORDER = RGB(0x60, 0x60, 0x60);
+static constexpr COLORREF CJF_UI_TEXT = RGB(0xff, 0xff, 0xff);
 #define CONFIRM_RETRY_TIMER_ID 4
 #define CONFIRM_RETRY_INTERVAL_MS 50
 #define CONFIRM_RETRY_MAX 20
@@ -133,22 +155,82 @@ static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, 
     case WM_CREATE: {
         HWND checkbox = CreateWindowExW(
             0, L"BUTTON", L"チェックボックス式起動を有効にする",
-            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX | BS_OWNERDRAW,
             16, 16, 300, 24, hwnd, reinterpret_cast<HMENU>(CONFIG_CHECKBOX_ID),
             module_instance, nullptr);
         SendMessageW(checkbox, BM_SETCHECK,
             checkbox_polling_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
         CreateWindowExW(
-            0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
             236, 52, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
             module_instance, nullptr);
         return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        HBRUSH brush = CreateSolidBrush(CJF_UI_BG);
+        FillRect(reinterpret_cast<HDC>(wparam), &rc, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, CJF_UI_TEXT);
+        SetBkColor(dc, CJF_UI_BG);
+        static HBRUSH brush = CreateSolidBrush(CJF_UI_BG);
+        return reinterpret_cast<LRESULT>(brush);
+    }
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lparam);
+        if (dis->CtlID == CONFIG_CHECKBOX_ID) {
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, CJF_UI_TEXT);
+            RECT box = dis->rcItem;
+            box.right = box.left + 16;
+            box.bottom = box.top + 16;
+            HBRUSH bg = CreateSolidBrush(CJF_UI_BG);
+            FillRect(dis->hDC, &box, bg);
+            DeleteObject(bg);
+            HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
+            FrameRect(dis->hDC, &box, border);
+            DeleteObject(border);
+            if (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED) {
+                HPEN pen = CreatePen(PS_SOLID, 2, CJF_UI_TEXT);
+                HGDIOBJ old_pen = SelectObject(dis->hDC, pen);
+                MoveToEx(dis->hDC, box.left + 3, box.top + 8, nullptr);
+                LineTo(dis->hDC, box.left + 7, box.bottom - 3);
+                LineTo(dis->hDC, box.right - 3, box.top + 3);
+                SelectObject(dis->hDC, old_pen);
+                DeleteObject(pen);
+            }
+            RECT text = dis->rcItem;
+            text.left += 24;
+            DrawTextW(dis->hDC, L"チェックボックス式起動を有効にする", -1, &text,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
+        }
+        if (dis->CtlID != IDCANCEL) break;
+        HBRUSH brush = CreateSolidBrush(
+            (dis->itemState & ODS_SELECTED) ? CJF_UI_BG : CJF_UI_BUTTON);
+        FillRect(dis->hDC, &dis->rcItem, brush);
+        DeleteObject(brush);
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, CJF_UI_TEXT);
+        DrawTextW(dis->hDC, L"閉じる", -1, &dis->rcItem,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
+        FrameRect(dis->hDC, &dis->rcItem, border);
+        DeleteObject(border);
+        return TRUE;
     }
     case WM_COMMAND:
         if (LOWORD(wparam) == CONFIG_CHECKBOX_ID && HIWORD(wparam) == BN_CLICKED) {
             checkbox_polling_enabled = (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED);
             save_settings();
             update_poll_timer();
+            InvalidateRect(GetDlgItem(hwnd, CONFIG_CHECKBOX_ID), nullptr, TRUE);
             return 0;
         }
         if (LOWORD(wparam) == IDCANCEL) {
@@ -1028,8 +1110,52 @@ static void poll_pick_trigger() {
     }
 }
 
+// パネル起動時の対象解決。該当オブジェクトが無ければ、現在フレームから
+// 3 秒分の図形ツールを空きレイヤーへ作成し、そのハンドルを適用対象にする。
+static bool prepare_panel_range_target() {
+    if (!edit_handle) return false;
+    EDIT_INFO info = {};
+    edit_handle->get_edit_info(&info, sizeof(info));
+    struct PanelCtx {
+        EDIT_INFO info;
+        OBJECT_HANDLE target;
+    } ctx = { info, nullptr };
+    if (!edit_handle->call_edit_section_param(&ctx, [](void* param, EDIT_SECTION* edit) {
+        PanelCtx* p = static_cast<PanelCtx*>(param);
+        auto is_target = [](EDIT_SECTION* ed, OBJECT_HANDLE obj) {
+            return obj && ed->count_object_effect(obj, L"図形ツール") > 0;
+        };
+        int n = edit->get_selected_object_num();
+        for (int i = 0; i < n && !p->target; ++i) {
+            OBJECT_HANDLE obj = edit->get_selected_object(i);
+            if (is_target(edit, obj)) p->target = obj;
+        }
+        if (!p->target) {
+            OBJECT_HANDLE obj = edit->get_focus_object();
+            if (is_target(edit, obj)) p->target = obj;
+        }
+        if (p->target) return;
+
+        int fps = p->info.scale > 0 ? p->info.rate / p->info.scale : p->info.rate;
+        int length = std::max(1, static_cast<int>(std::lround(3.0 * std::max(1, fps))));
+        int first = std::max(0, p->info.layer);
+        for (int pass = 0; pass <= p->info.layer_max && !p->target; ++pass) {
+            int layer = (first + pass) % std::max(1, p->info.layer_max + 1);
+            if (edit->find_object(layer, p->info.frame)) continue;
+            p->target = edit->create_object_from_alias(
+                range_object_alias, layer, p->info.frame, length);
+            if (p->target) edit->set_focus_object(p->target);
+        }
+    })) {
+        return false;
+    }
+    if (!ctx.target) return false;
+    ctx_menu_object = ctx.target;
+    return true;
+}
+
 // Phase 5 UI: ドッキングパネルのウィンドウプロシージャ。
-// 「プレビューから範囲指定」ボタンのみを配置する。
+// ペン／矩形の2つの起動ボタンを配置する。
 // 配色は AviUtl2 のダークテーマ (#202020 背景 + 白文字、テーマ切替なし) に合わせて
 // 固定で描画する。ボタンはオーナードロー (BS_OWNERDRAW) でホバー/押下の状態も描く。
 #define PANEL_BG_COLOR   RGB(0x20, 0x20, 0x20) // パネル/ボタン背景
@@ -1041,7 +1167,16 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
     switch (message) {
     case WM_COMMAND: {
         if (LOWORD(wparam) == IDC_RANGE_BUTTON) {
-            request_range_select();
+            if (prepare_panel_range_target()) request_range_select();
+            SetFocus(nullptr);
+            return 0;
+        }
+        if (LOWORD(wparam) == IDC_PEN_BUTTON) {
+            HWND pen_window = FindWindowW(pen_frame_class_name, nullptr);
+            if (pen_window) {
+                UINT message_id = RegisterWindowMessageW(pen_panel_message_name);
+                PostMessageW(pen_window, message_id, 0, 0);
+            }
             SetFocus(nullptr); // ボタンのフォーカスを外す (サンプル準拠)
             return 0;
         }
@@ -1049,12 +1184,13 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
     }
     case WM_SIZE: {
         // パネルのリサイズに合わせてボタンをフィットさせる
-        HWND btn = GetDlgItem(hwnd, IDC_RANGE_BUTTON);
-        if (btn) {
-            RECT rc = {};
-            GetClientRect(hwnd, &rc);
-            MoveWindow(btn, 0, 0, rc.right, rc.bottom, TRUE);
-        }
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        int width = static_cast<int>(std::max<LONG>(1, (rc.right - rc.left) / 2));
+        HWND range_btn = GetDlgItem(hwnd, IDC_RANGE_BUTTON);
+        HWND pen_btn = GetDlgItem(hwnd, IDC_PEN_BUTTON);
+        if (range_btn) MoveWindow(range_btn, 0, 0, width, rc.bottom, TRUE);
+        if (pen_btn) MoveWindow(pen_btn, width, 0, rc.right - width, rc.bottom, TRUE);
         return 0;
     }
     case WM_ERASEBKGND: {
@@ -1067,9 +1203,10 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         return 1;
     }
     case WM_DRAWITEM: {
-        // オーナードローされた「プレビューから範囲指定」ボタンの描画
+        // オーナードローされたパネルボタンの描画
         LPDRAWITEMSTRUCT dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lparam);
-        if (dis->CtlType != ODT_BUTTON || dis->CtlID != IDC_RANGE_BUTTON) break;
+        if (dis->CtlType != ODT_BUTTON ||
+            (dis->CtlID != IDC_RANGE_BUTTON && dis->CtlID != IDC_PEN_BUTTON)) break;
         HDC dc = dis->hDC;
         RECT rc = dis->rcItem;
         COLORREF bg = PANEL_BG_COLOR;
@@ -1078,10 +1215,14 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         HBRUSH br = CreateSolidBrush(bg);
         FillRect(dc, &rc, br);
         DeleteObject(br);
+        HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
+        FrameRect(dc, &rc, border);
+        DeleteObject(border);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, PANEL_TEXT_COLOR);
         HGDIOBJ old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-        DrawTextW(dc, L"プレビューから範囲指定", -1, &rc,
+        LPCWSTR label = dis->CtlID == IDC_PEN_BUTTON ? L"ペン" : L"矩形";
+        DrawTextW(dc, label, -1, &rc,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, old_font);
         if (dis->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
@@ -1304,22 +1445,27 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
     pwc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     if (RegisterClassExW(&pwc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
         panel_window = CreateWindowExW(
-            0, panel_class_name, L"CJF 範囲指定", WS_POPUP,
+            0, panel_class_name, L"CJF ツール", WS_POPUP,
             CW_USEDEFAULT, CW_USEDEFAULT, 220, 40,
             nullptr, nullptr, module_instance, nullptr);
         if (panel_window) {
             // パネルいっぱいのボタン
             CreateWindowExW(
-                0, L"BUTTON", L"プレビューから範囲指定",
+            0, L"BUTTON", L"矩形",
                 WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-                0, 0, 220, 40,
+                0, 0, 110, 40,
                 panel_window, reinterpret_cast<HMENU>(IDC_RANGE_BUTTON), module_instance, nullptr);
-            host->register_window_client(L"CJF 範囲指定", panel_window);
+            CreateWindowExW(
+                0, L"BUTTON", L"ペン",
+                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                110, 0, 110, 40,
+                panel_window, reinterpret_cast<HMENU>(IDC_PEN_BUTTON), module_instance, nullptr);
+            host->register_window_client(L"CJF ツール", panel_window);
         }
     }
 
     if (logger) {
         logger->log(logger,
-            L"[CJF RangeSelector] initialized. Use 編集>CJF>プレビューから範囲指定 / object-settings right-click / CJF panel to start.");
+            L"[CJF RangeSelector] initialized. Use the CJF panel buttons or 編集>CJF>プレビューから範囲指定 to start.");
     }
 }

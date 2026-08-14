@@ -44,6 +44,29 @@ static EDIT_HANDLE* edit_handle = nullptr; // RegisterPlugin で取得、以後�
 
 static HWND frame_window = nullptr;
 static const wchar_t frame_class_name[] = L"CJFPreviewPenFrame";
+static constexpr wchar_t panel_message_name[] = L"CJF.PreviewRangeSelector.Panel.Pen";
+static const char pen_object_alias[] = u8R"([Object]
+[Object.0]
+effect.name=ペンツール
+進捗スライダーで制御=0
+進捗(%)=0.00
+ペンモード起動=0
+線をクリア=0
+ペンの太さ(px)=8
+入り長さ=0
+入り太さ=0
+抜き長さ=0
+抜き太さ=0
+柔らかさ=2
+手ブレ補正=16
+形状優先=3
+色=000000
+線の座標(シーンpx・ミリ秒)=""
+[Object.1]
+effect.name=標準描画
+X=0.00
+Y=0.00
+)";
 
 // チェックONで検知した対象オブジェクト（適用時に選択状態へ依存しない）
 static OBJECT_HANDLE pen_trigger_object = nullptr;
@@ -63,6 +86,10 @@ static bool polling_in_progress = false;
 static DWORD polling_backoff_until = 0;
 #define CONFIG_CHECKBOX_ID 3001
 static HWND config_window = nullptr;
+static constexpr COLORREF CJF_UI_BG = RGB(0x20, 0x20, 0x20);
+static constexpr COLORREF CJF_UI_BUTTON = RGB(0x2a, 0x2a, 0x2a);
+static constexpr COLORREF CJF_UI_BORDER = RGB(0x60, 0x60, 0x60);
+static constexpr COLORREF CJF_UI_TEXT = RGB(0xff, 0xff, 0xff);
 #define CONFIRM_RETRY_TIMER_ID 4
 #define CONFIRM_RETRY_INTERVAL_MS 50
 #define CONFIRM_RETRY_MAX 20
@@ -130,22 +157,82 @@ static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, 
     case WM_CREATE: {
         HWND checkbox = CreateWindowExW(
             0, L"BUTTON", L"チェックボックス式起動を有効にする",
-            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX | BS_OWNERDRAW,
             16, 16, 300, 24, hwnd, reinterpret_cast<HMENU>(CONFIG_CHECKBOX_ID),
             module_instance, nullptr);
         SendMessageW(checkbox, BM_SETCHECK,
             checkbox_polling_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
         CreateWindowExW(
-            0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
             236, 52, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
             module_instance, nullptr);
         return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        HBRUSH brush = CreateSolidBrush(CJF_UI_BG);
+        FillRect(reinterpret_cast<HDC>(wparam), &rc, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, CJF_UI_TEXT);
+        SetBkColor(dc, CJF_UI_BG);
+        static HBRUSH brush = CreateSolidBrush(CJF_UI_BG);
+        return reinterpret_cast<LRESULT>(brush);
+    }
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lparam);
+        if (dis->CtlID == CONFIG_CHECKBOX_ID) {
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, CJF_UI_TEXT);
+            RECT box = dis->rcItem;
+            box.right = box.left + 16;
+            box.bottom = box.top + 16;
+            HBRUSH bg = CreateSolidBrush(CJF_UI_BG);
+            FillRect(dis->hDC, &box, bg);
+            DeleteObject(bg);
+            HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
+            FrameRect(dis->hDC, &box, border);
+            DeleteObject(border);
+            if (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED) {
+                HPEN pen = CreatePen(PS_SOLID, 2, CJF_UI_TEXT);
+                HGDIOBJ old_pen = SelectObject(dis->hDC, pen);
+                MoveToEx(dis->hDC, box.left + 3, box.top + 8, nullptr);
+                LineTo(dis->hDC, box.left + 7, box.bottom - 3);
+                LineTo(dis->hDC, box.right - 3, box.top + 3);
+                SelectObject(dis->hDC, old_pen);
+                DeleteObject(pen);
+            }
+            RECT text = dis->rcItem;
+            text.left += 24;
+            DrawTextW(dis->hDC, L"チェックボックス式起動を有効にする", -1, &text,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
+        }
+        if (dis->CtlID != IDCANCEL) break;
+        HBRUSH brush = CreateSolidBrush(
+            (dis->itemState & ODS_SELECTED) ? CJF_UI_BG : CJF_UI_BUTTON);
+        FillRect(dis->hDC, &dis->rcItem, brush);
+        DeleteObject(brush);
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, CJF_UI_TEXT);
+        DrawTextW(dis->hDC, L"閉じる", -1, &dis->rcItem,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
+        FrameRect(dis->hDC, &dis->rcItem, border);
+        DeleteObject(border);
+        return TRUE;
     }
     case WM_COMMAND:
         if (LOWORD(wparam) == CONFIG_CHECKBOX_ID && HIWORD(wparam) == BN_CLICKED) {
             checkbox_polling_enabled = (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED);
             save_settings();
             update_poll_timer();
+            InvalidateRect(GetDlgItem(hwnd, CONFIG_CHECKBOX_ID), nullptr, TRUE);
             return 0;
         }
         if (LOWORD(wparam) == IDCANCEL) {
@@ -1371,7 +1458,56 @@ static void poll_pen_trigger() {
     }
 }
 
+// パネル起動時の対象解決。該当オブジェクトが無ければ、現在フレームから
+// 3 秒分のペンツールを空きレイヤーへ作成し、そのハンドルを対象にする。
+static bool prepare_panel_pen_target() {
+    if (!edit_handle) return false;
+    EDIT_INFO info = {};
+    edit_handle->get_edit_info(&info, sizeof(info));
+    struct PanelCtx {
+        EDIT_INFO info;
+        OBJECT_HANDLE target;
+    } ctx = { info, nullptr };
+    if (!edit_handle->call_edit_section_param(&ctx, [](void* param, EDIT_SECTION* edit) {
+        PanelCtx* p = static_cast<PanelCtx*>(param);
+        auto is_target = [](EDIT_SECTION* ed, OBJECT_HANDLE obj) {
+            return obj && ed->count_object_effect(obj, L"ペンツール") > 0;
+        };
+        int n = edit->get_selected_object_num();
+        for (int i = 0; i < n && !p->target; ++i) {
+            OBJECT_HANDLE obj = edit->get_selected_object(i);
+            if (is_target(edit, obj)) p->target = obj;
+        }
+        if (!p->target) {
+            OBJECT_HANDLE obj = edit->get_focus_object();
+            if (is_target(edit, obj)) p->target = obj;
+        }
+        if (p->target) return;
+
+        int fps = p->info.scale > 0 ? p->info.rate / p->info.scale : p->info.rate;
+        int length = std::max(1, static_cast<int>(std::lround(3.0 * std::max(1, fps))));
+        int first = std::max(0, p->info.layer);
+        for (int pass = 0; pass <= p->info.layer_max && !p->target; ++pass) {
+            int layer = (first + pass) % std::max(1, p->info.layer_max + 1);
+            if (edit->find_object(layer, p->info.frame)) continue;
+            p->target = edit->create_object_from_alias(
+                pen_object_alias, layer, p->info.frame, length);
+            if (p->target) edit->set_focus_object(p->target);
+        }
+    })) {
+        return false;
+    }
+    if (!ctx.target) return false;
+    pen_trigger_object = ctx.target;
+    return true;
+}
+
 static LRESULT CALLBACK frame_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    static UINT panel_message = RegisterWindowMessageW(panel_message_name);
+    if (message == panel_message) {
+        if (prepare_panel_pen_target()) request_pen_mode();
+        return 0;
+    }
     switch (message) {
     case WM_TIMER: {
         if (wparam == 2 && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) {
