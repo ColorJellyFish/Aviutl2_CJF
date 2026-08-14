@@ -153,13 +153,15 @@ static void update_poll_timer() {
 static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
     case WM_CREATE: {
-        HWND checkbox = CreateWindowExW(
+        // BS_OWNERDRAW はボタン種別 (BS_TYPEMASK) を上書きするため、
+        // BS_AUTOCHECKBOX を併用してもチェック状態は保持されない
+        // (MSDN: BS_OWNERDRAW は他のボタンスタイルと併用しない)。
+        // 見た目は WM_DRAWITEM で描画し、状態は checkbox_polling_enabled で管理する。
+        CreateWindowExW(
             0, L"BUTTON", L"チェックボックス式起動を有効にする",
-            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX | BS_OWNERDRAW,
+            WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
             16, 16, 300, 24, hwnd, reinterpret_cast<HMENU>(CONFIG_CHECKBOX_ID),
             module_instance, nullptr);
-        SendMessageW(checkbox, BM_SETCHECK,
-            checkbox_polling_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
         CreateWindowExW(
             0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
             236, 52, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
@@ -196,7 +198,7 @@ static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, 
             HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
             FrameRect(dis->hDC, &box, border);
             DeleteObject(border);
-            if (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED) {
+            if (checkbox_polling_enabled) {
                 HPEN pen = CreatePen(PS_SOLID, 2, CJF_UI_TEXT);
                 HGDIOBJ old_pen = SelectObject(dis->hDC, pen);
                 MoveToEx(dis->hDC, box.left + 3, box.top + 8, nullptr);
@@ -227,7 +229,9 @@ static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     case WM_COMMAND:
         if (LOWORD(wparam) == CONFIG_CHECKBOX_ID && HIWORD(wparam) == BN_CLICKED) {
-            checkbox_polling_enabled = (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED);
+            // BS_OWNERDRAW 種別のボタンにはチェック状態が無い (BM_GETCHECK 常に0)。
+            // 状態は checkbox_polling_enabled で自前管理し、クリックで反転する。
+            checkbox_polling_enabled = !checkbox_polling_enabled;
             save_settings();
             update_poll_timer();
             InvalidateRect(GetDlgItem(hwnd, CONFIG_CHECKBOX_ID), nullptr, TRUE);
