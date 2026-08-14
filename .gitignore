@@ -1,6 +1,22 @@
 __pycache__/
-scripts/__pycache__/
 *.pyc
-release/
 
+# === 公開禁止 (private-only) ===
+# 公開リポジトリ github.com/ColorJellyFish/Aviutl2_CJF には含まれていない開発専用ファイル。
+# 誤って公開リポジトリへコミット・push しないよう、追跡対象外にしておく。
+# 意図的に公開する場合のみ git add -f で明示的に追加すること。
+aviutl2_sdk/
+scripts/
+docs/
+README_Public.md
+risou.png
+sample.png
+src/object_cjf/楕円形.obj2
+src/object_cjf/長方形.obj2
+src/preview_range_cjf/PreviewMouseProbe.cpp
+
+# エディタ設定（公開しない）
+.cursor/
+
+release/
 build/
