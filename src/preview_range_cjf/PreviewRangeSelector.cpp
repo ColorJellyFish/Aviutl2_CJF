@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <new>
 #include <vector>
 
 #include "plugin2.h"
@@ -58,6 +59,10 @@ static const wchar_t panel_class_name[] = L"CJFPreviewRangePanel";
 #define PICK_POLL_TIMER_ID 3
 #define PICK_POLL_INTERVAL_MS 200
 static bool pick_trigger_detected = false; // 検知→適用/キャンセルまで再検知を防ぐ
+#define CONFIRM_RETRY_TIMER_ID 4
+#define CONFIRM_RETRY_INTERVAL_MS 50
+#define CONFIRM_RETRY_MAX 20
+static int confirm_retry_count = 0;
 
 // レンダリングで取得した現在フレーム (シーン解像度, RGBA, r が先頭)
 static std::vector<unsigned char> frame_rgba;
@@ -76,6 +81,14 @@ static Mode mode = Mode::Idle;
 
 // レンダリング中の再入を防ぐ。
 static bool render_in_progress = false;
+
+// L-SMASH WorksはIndex作成中、lwinputダイアログを表示しながら自前の
+// メッセージポンプでホスト側メッセージもDispatchする。そこへ編集セクション
+// の読み取りを再入すると、入力処理中のロックと競合してデッドロックし得る。
+// lwinputのダイアログ表示中は、チェック監視を行わない。
+static bool is_lwinput_busy() {
+    return FindWindowW(nullptr, L"lwinput") != nullptr;
+}
 
 static bool dragging = false;
 static POINT drag_start = { 0, 0 };
@@ -96,9 +109,13 @@ static RangeSelectResult last_result = { 0, 0, 0, 0, 0, 0, 0, 0 };
 struct RenderCtx {
     unsigned char* dst; // RGBA コピー先 (frame_rgba.data())
     int w, h;
-    HANDLE done;        // 手動リセットイベント
     volatile LONG copied;
+    HWND notify_window;
+    int frame;
+    DWORD started_at;
 };
+
+static constexpr UINT WM_CJF_RENDER_COMPLETE = WM_APP + 10;
 
 // レンダリング完了時にイベント通知スレッドから呼ばれる。
 // バッファはコールバック中のみ有効なので、即座にコピーして完了を通知する。
@@ -114,23 +131,26 @@ static void on_rendered(void* param, int frame, const void* buffer, int width, i
         }
         InterlockedExchange(&ctx->copied, 1);
     }
-    SetEvent(ctx->done);
+    if (!PostMessageW(ctx->notify_window, WM_CJF_RENDER_COMPLETE, 0,
+                      reinterpret_cast<LPARAM>(ctx)))
+        delete ctx;
 }
 
 // 指定フレームのシーン出力をレンダリングし、RGBA バッファにコピーする。
 // 戻り値: レンダリング受理かつバッファ取得成功なら true。
 static bool render_current_frame(int frame, unsigned char* dst, int w, int h) {
     if (!edit_handle) return false;
-    RenderCtx ctx = { dst, w, h, CreateEventW(nullptr, TRUE, FALSE, nullptr), 0 };
-    bool accepted = edit_handle->rendering_scene_video(frame, &ctx, on_rendered);
+    RenderCtx* ctx = new (std::nothrow) RenderCtx{ dst, w, h, 0, frame_window, frame, GetTickCount() };
+    if (!ctx) return false;
+    bool accepted = edit_handle->rendering_scene_video(frame, ctx, on_rendered);
     if (accepted) {
         // wait_rendering_task は無制限待機のため、ハング時の切り分け用ログ
         if (logger) logger->log(logger, L"[CJF RangeSelector] render task submitted, waiting...");
-        edit_handle->wait_rendering_task();
-        WaitForSingleObject(ctx.done, 10000);
+        // 完了コールバックがUIスレッドへ通知するため、ここでは待たない。
+        return true;
     }
-    CloseHandle(ctx.done);
-    return accepted && ctx.copied != 0;
+    delete ctx;
+    return false;
 }
 
 //-----------------------------------------------------------------------------
@@ -302,6 +322,7 @@ static void redraw_frame() {
 static void hide_frame() {
     if (frame_window && IsWindow(frame_window)) {
         KillTimer(frame_window, 2);
+        KillTimer(frame_window, CONFIRM_RETRY_TIMER_ID);
         ShowWindow(frame_window, SW_HIDE);
     }
     mode = Mode::Idle;
@@ -309,6 +330,46 @@ static void hide_frame() {
     pick_trigger_detected = false; // チェックポーリングの再検知を許可
     if (GetCapture() == frame_window) ReleaseCapture();
     if (host_window && IsWindow(host_window)) SetFocus(host_window);
+}
+
+static void finish_range_select(RenderCtx* ctx) {
+    DWORD render_ms = GetTickCount() - ctx->started_at;
+    if (!ctx->copied) {
+        frame_rgba.clear();
+        render_in_progress = false;
+        if (pick_trigger_detected) {
+            pick_trigger_detected = false;
+            reset_pick_checkbox();
+        }
+        delete ctx;
+        return;
+    }
+    frame_w = ctx->w;
+    frame_h = ctx->h;
+    const float max_w = 1280.0f, max_h = 800.0f;
+    float window_per_scene = std::min(1.0f, max_w / static_cast<float>(frame_w));
+    window_per_scene = std::min(window_per_scene, max_h / static_cast<float>(frame_h));
+    scene_per_window = 1.0f / window_per_scene;
+    client_w = std::max(1, static_cast<int>(std::lroundf(frame_w * window_per_scene)));
+    client_h = std::max(1, static_cast<int>(std::lroundf(frame_h * window_per_scene)));
+    build_display_buffer();
+    RECT host_rc = {};
+    GetWindowRect(host_window, &host_rc);
+    int x = host_rc.left + (host_rc.right - host_rc.left - client_w) / 2;
+    int y = host_rc.top + (host_rc.bottom - host_rc.top - client_h) / 2;
+    SetWindowPos(frame_window, HWND_TOPMOST, x, y, client_w, client_h,
+                 SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    mode = Mode::RangeSelect;
+    dragging = false;
+    redraw_frame();
+    SetTimer(frame_window, 2, 33, nullptr);
+    render_in_progress = false;
+    if (logger) {
+        wchar_t m[256] = {};
+        swprintf_s(m, L"[CJF RangeSelector] frame rendered in %lu ms", render_ms);
+        logger->log(logger, m);
+    }
+    delete ctx;
 }
 
 static void begin_range_select() {
@@ -333,12 +394,23 @@ static void begin_range_select() {
     // デッドロックするため、この関数はメニューコールバックではなく
     // PostMessage で遅延されたメッセージループ側から呼ばれる)
     frame_rgba.assign(static_cast<size_t>(info.width) * info.height * 4, 0);
-    DWORD t0 = GetTickCount();
     if (logger) {
         wchar_t m[256] = {};
         swprintf_s(m, L"[CJF RangeSelector] rendering frame=%d (%dx%d)...", info.frame, info.width, info.height);
         logger->log(logger, m);
     }
+    if (!render_current_frame(info.frame, frame_rgba.data(), info.width, info.height)) {
+        frame_rgba.clear();
+        render_in_progress = false;
+        if (pick_trigger_detected) {
+            pick_trigger_detected = false;
+            reset_pick_checkbox();
+        }
+        return;
+    }
+    // 完了後の表示処理はWM_CJF_RENDER_COMPLETEから続行する。
+    return;
+#if 0
     bool ok = render_current_frame(info.frame, frame_rgba.data(), info.width, info.height);
     DWORD render_ms = GetTickCount() - t0;
     if (!ok) {
@@ -398,6 +470,7 @@ static void begin_range_select() {
             IsWindowVisible(frame_window) ? 1 : 0);
         logger->log(logger, m);
     }
+#endif
 }
 
 // チェックボタン式起動: 選択中オブジェクトの「プレビューから範囲指定」チェックを OFF に戻す。
@@ -634,8 +707,8 @@ static void log_apply_crashed(const ApplyResultCtx& ctx, int w, int h) {
     logger->log(logger, m);
 }
 
-static void apply_result_to_shape_tools() {
-    if (!edit_handle || last_result.width < 1 || last_result.height < 1) return;
+static bool apply_result_to_shape_tools() {
+    if (!edit_handle || last_result.width < 1 || last_result.height < 1) return false;
 
     // 図形ツール.obj2 のトラック範囲にクランプ
     const int kTrackMin = 1, kTrackMax = 16384; // 幅/高さ (--track@w:幅(px),1,16384)
@@ -686,26 +759,26 @@ static void apply_result_to_shape_tools() {
     // 戻り値: true なら成功 / 編集できない場合(出力中など)は失敗しコールバックは呼ばれない
     if (!edit_handle->call_read_section_param(&ctx, apply_scan_edit)) {
         log_apply_section_failed(L"could not enter read section (playback/output in progress?)", clamped.width, clamped.height);
-        return;
+        return false;
     }
     if (ctx.crashed) {
         log_apply_crashed(ctx, clamped.width, clamped.height);
-        return;
+        return false;
     }
     if (ctx.pick_was_on) {
         if (!edit_handle->call_edit_section_param(&ctx, apply_pick_reset_edit)) {
             log_apply_section_failed(L"could not enter edit section (playback/output in progress?)", clamped.width, clamped.height);
-            return;
+            return false;
         }
         // ステップ1 がクラッシュした場合は座標書込 (ステップ2) をスキップ
         if (ctx.crashed) {
             log_apply_crashed(ctx, clamped.width, clamped.height);
-            return;
+            return false;
         }
     }
     if (!edit_handle->call_edit_section_param(&ctx, apply_coords_edit)) {
         log_apply_section_failed(L"could not enter edit section for coords (playback/output in progress?)", clamped.width, clamped.height);
-        return;
+        return false;
     }
 
     if (logger) {
@@ -747,6 +820,23 @@ static void apply_result_to_shape_tools() {
         }
         logger->log(logger, m);
     }
+    return ctx.applied > 0;
+}
+
+static void retry_range_confirm() {
+    if (mode != Mode::RangeSelect || last_result.width < 1 || last_result.height < 1)
+        return;
+    if (apply_result_to_shape_tools()) {
+        KillTimer(frame_window, CONFIRM_RETRY_TIMER_ID);
+        confirm_retry_count = 0;
+        hide_frame();
+        return;
+    }
+    if (++confirm_retry_count >= CONFIRM_RETRY_MAX) {
+        KillTimer(frame_window, CONFIRM_RETRY_TIMER_ID);
+        confirm_retry_count = 0;
+        if (logger) logger->warn(logger, L"[CJF RangeSelector] confirm retry limit reached; selection kept for manual retry");
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -774,6 +864,7 @@ static void request_range_select() {
 static void poll_pick_trigger() {
     if (!edit_handle || !frame_window || pick_trigger_detected) return;
     if (mode != Mode::Idle || render_in_progress) return;
+    if (is_lwinput_busy()) return;
 
     // チェックボックスはセクション単位のため、現在フレームの値を読む。
     // frame=0 を渡すと 0 フレーム時点の値になり、後ろのフレームで ON にした
@@ -894,6 +985,14 @@ static LRESULT CALLBACK frame_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         if (wparam == PICK_POLL_TIMER_ID) {
             poll_pick_trigger();
         }
+        if (wparam == CONFIRM_RETRY_TIMER_ID) {
+            retry_range_confirm();
+        }
+        return 0;
+    }
+    case WM_CJF_RENDER_COMPLETE: {
+        RenderCtx* ctx = reinterpret_cast<RenderCtx*>(lparam);
+        if (ctx) finish_range_select(ctx);
         return 0;
     }
     case WM_APP + 1: {
@@ -953,7 +1052,13 @@ static LRESULT CALLBACK frame_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         }
 
         // Phase 4: 選択中の CJF 図形ツールオブジェクトへ W/H を反映
-        apply_result_to_shape_tools();
+        if (!apply_result_to_shape_tools()) {
+            // 最初の編集セクションだけ成功した場合があるため、UIイベントを返してから再試行する。
+            // これによりチェックOFF→座標書込の段階差をユーザー操作で吸収しない。
+            confirm_retry_count = 0;
+            SetTimer(frame_window, CONFIRM_RETRY_TIMER_ID, CONFIRM_RETRY_INTERVAL_MS, nullptr);
+            return 0;
+        }
         hide_frame();
         return 0;
     }
