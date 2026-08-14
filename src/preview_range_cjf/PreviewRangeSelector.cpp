@@ -227,10 +227,17 @@ static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     case WM_COMMAND:
         if (LOWORD(wparam) == CONFIG_CHECKBOX_ID && HIWORD(wparam) == BN_CLICKED) {
-            checkbox_polling_enabled = (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED);
+            // BS_OWNERDRAW と併用すると BS_AUTOCHECKBOX の自動トグルが効かない
+            // (MSDN: BS_OWNERDRAW は他のボタンスタイルと併用しない)。
+            // クリック時に状態を手動で反転し BM_SETCHECK で反映する。
+            HWND checkbox = GetDlgItem(hwnd, CONFIG_CHECKBOX_ID);
+            checkbox_polling_enabled =
+                (SendMessageW(checkbox, BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+            SendMessageW(checkbox, BM_SETCHECK,
+                checkbox_polling_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
             save_settings();
             update_poll_timer();
-            InvalidateRect(GetDlgItem(hwnd, CONFIG_CHECKBOX_ID), nullptr, TRUE);
+            InvalidateRect(checkbox, nullptr, TRUE);
             return 0;
         }
         if (LOWORD(wparam) == IDCANCEL) {
