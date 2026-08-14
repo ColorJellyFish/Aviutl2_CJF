@@ -13,8 +13,7 @@
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build/vs2022-x64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CJF_BUILD_PREVIEW_MOUSE_PROBE": "ON"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     }
   ],
