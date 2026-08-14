@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cwchar>
 #include <new>
+#include <string>
 #include <vector>
 
 #include "plugin2.h"
@@ -59,6 +60,11 @@ static const wchar_t panel_class_name[] = L"CJFPreviewRangePanel";
 #define PICK_POLL_TIMER_ID 3
 #define PICK_POLL_INTERVAL_MS 200
 static bool pick_trigger_detected = false; // 検知→適用/キャンセルまで再検知を防ぐ
+static bool checkbox_polling_enabled = true;
+static bool polling_in_progress = false;
+static DWORD polling_backoff_until = 0;
+#define CONFIG_CHECKBOX_ID 3001
+static HWND config_window = nullptr;
 #define CONFIRM_RETRY_TIMER_ID 4
 #define CONFIRM_RETRY_INTERVAL_MS 50
 #define CONFIRM_RETRY_MAX 20
@@ -88,6 +94,105 @@ static bool render_in_progress = false;
 // lwinputのダイアログ表示中は、チェック監視を行わない。
 static bool is_lwinput_busy() {
     return FindWindowW(nullptr, L"lwinput") != nullptr;
+}
+
+static std::wstring get_config_path() {
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(module_instance, path, MAX_PATH)) return {};
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return {};
+    *(slash + 1) = L'\0';
+    return std::wstring(path) + L"CJFPreviewRangeSelector.ini";
+}
+
+static void load_settings() {
+    const std::wstring path = get_config_path();
+    if (!path.empty())
+        checkbox_polling_enabled = GetPrivateProfileIntW(
+            L"General", L"EnableCheckboxPolling", 1, path.c_str()) != 0;
+}
+
+static void save_settings() {
+    const std::wstring path = get_config_path();
+    if (!path.empty())
+        WritePrivateProfileStringW(
+            L"General", L"EnableCheckboxPolling",
+            checkbox_polling_enabled ? L"1" : L"0", path.c_str());
+}
+
+static void update_poll_timer() {
+    if (!frame_window) return;
+    if (checkbox_polling_enabled)
+        SetTimer(frame_window, PICK_POLL_TIMER_ID, PICK_POLL_INTERVAL_MS, nullptr);
+    else
+        KillTimer(frame_window, PICK_POLL_TIMER_ID);
+}
+
+static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_CREATE: {
+        HWND checkbox = CreateWindowExW(
+            0, L"BUTTON", L"チェックボックス式起動を有効にする",
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            16, 16, 300, 24, hwnd, reinterpret_cast<HMENU>(CONFIG_CHECKBOX_ID),
+            module_instance, nullptr);
+        SendMessageW(checkbox, BM_SETCHECK,
+            checkbox_polling_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        CreateWindowExW(
+            0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            236, 52, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
+            module_instance, nullptr);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wparam) == CONFIG_CHECKBOX_ID && HIWORD(wparam) == BN_CLICKED) {
+            checkbox_polling_enabled = (IsDlgButtonChecked(hwnd, CONFIG_CHECKBOX_ID) == BST_CHECKED);
+            save_settings();
+            update_poll_timer();
+            return 0;
+        }
+        if (LOWORD(wparam) == IDCANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        config_window = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static void open_config_window(HWND owner, HINSTANCE dll_hinst) {
+    if (config_window && IsWindow(config_window)) {
+        ShowWindow(config_window, SW_SHOWNORMAL);
+        SetForegroundWindow(config_window);
+        return;
+    }
+    static bool class_registered = false;
+    if (!class_registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = config_wnd_proc;
+        wc.hInstance = dll_hinst ? dll_hinst : module_instance;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"CJFPreviewRangeConfig";
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
+        class_registered = true;
+    }
+    config_window = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, L"CJFPreviewRangeConfig", L"CJF 範囲指定の設定",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, 340, 125,
+        owner, nullptr, dll_hinst ? dll_hinst : module_instance, nullptr);
+    if (config_window) {
+        ShowWindow(config_window, SW_SHOWNORMAL);
+        UpdateWindow(config_window);
+    }
 }
 
 static bool dragging = false;
@@ -864,7 +969,13 @@ static void request_range_select() {
 static void poll_pick_trigger() {
     if (!edit_handle || !frame_window || pick_trigger_detected) return;
     if (mode != Mode::Idle || render_in_progress) return;
+    if (!checkbox_polling_enabled || polling_in_progress) return;
     if (is_lwinput_busy()) return;
+    if (GetCapture() != nullptr) return;
+    if (static_cast<LONG>(GetTickCount() - polling_backoff_until) < 0) return;
+    if (edit_handle->get_edit_state() != EDIT_HANDLE::EDIT_STATE_EDIT) return;
+    polling_in_progress = true;
+    struct PollGuard { bool& active; ~PollGuard() { active = false; } } guard{ polling_in_progress };
 
     // チェックボックスはセクション単位のため、現在フレームの値を読む。
     // frame=0 を渡すと 0 フレーム時点の値になり、後ろのフレームで ON にした
@@ -879,7 +990,7 @@ static void poll_pick_trigger() {
     } pick = { 0, info.frame };
 
     // 読み取りセクションで選択中オブジェクトを確認 (編集ロックを取らない軽い読み取り)
-    edit_handle->call_read_section_param(&pick, [](void* param, EDIT_SECTION* edit) {
+    if (!edit_handle->call_read_section_param(&pick, [](void* param, EDIT_SECTION* edit) {
         PickCtx* p = static_cast<PickCtx*>(param);
         int n = edit->get_selected_object_num();
         for (int i = 0; i < n && !p->found; ++i) {
@@ -904,7 +1015,11 @@ static void poll_pick_trigger() {
                 }
             }
         }
-    });
+    })) {
+        // 一時的に編集側が別の処理中なら、次の数回を飛ばして競合を拡大しない。
+        polling_backoff_until = GetTickCount() + 500;
+        return;
+    }
 
     if (pick.found) {
         pick_trigger_detected = true; // 適用/キャンセルまで再検知しない
@@ -1154,14 +1269,16 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         host_window, nullptr, module_instance, nullptr);
     if (!frame_window) return;
 
+    load_settings();
     // チェックボタン式起動のポーリングタイマー (常時動作。検知は Idle 時のみ)
-    SetTimer(frame_window, PICK_POLL_TIMER_ID, PICK_POLL_INTERVAL_MS, nullptr);
+    update_poll_timer();
 
     // 編集セクションを渡さないメニュー登録 (_param 版): 参照ロック状態で呼ばれないようにする。
     // さらに処理は PostMessage で遅延し、wait_rendering_task のデッドロックを確実に回避する。
     host->register_edit_menu_param(L"CJF\\プレビューから範囲指定", nullptr, [](void*) {
         request_range_select();
     });
+    host->register_config_menu(L"CJF\\範囲指定", open_config_window);
 
     // Phase 5 UI (A): オブジェクト設定ウィンドウの右クリックメニューに登録。
     // コールバックに OBJECT_HANDLE が直接渡るため、対象オブジェクトを保存して
