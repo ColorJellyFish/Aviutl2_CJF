@@ -15,8 +15,8 @@ AviUtl2 専用のスクリプトを配布するリポジトリです。
 
 ### Releases 対象ファイル(どちらか)
 
-- **`cjf_pentool-v*.*.*.au2pkg.zip`**
-- **`cjf_pentool-v*.*.*.exe.zip`**
+- **`cjf_pentool-v<version>.au2pkg.zip`**
+- **`cjf_pentool-v<version>.exe.zip`**
 
 バラして順番に導入しようとすると承認処理で落ちる可能性があります。  
 プレビュー画面に pkg を投げるか、 exe で導入してください。
@@ -57,8 +57,8 @@ AviUtl2 専用のスクリプトを配布するリポジトリです。
 PSDToolKit2 本体は含みません。別途導入してください。
 
 ### Releases 対象ファイル(どちらか)
-- **`cjf_psd-v*.*.*.au2pkg.zip`**
-- **`cjf_psd-v*.*.*.exe.zip`**
+- **`cjf_psd-v<version>.au2pkg.zip`**
+- **`cjf_psd-v<version>.exe.zip`**
 
 バラして順番に導入しようとすると承認処理で落ちる可能性があります。  
 プレビュー画面にpkgを投げるか、exeで導入してください。
@@ -95,7 +95,7 @@ anm2エディタで作ったものの場合は一番上が1です。
 
 ### Releases 対象ファイル
 
-- **`cjf_object-v0.1.1.au2pkg.zip`**
+- **`cjf_object-v<version>.au2pkg.zip`**
 
 ### 固定縁取り
 
