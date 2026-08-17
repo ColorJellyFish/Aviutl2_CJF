@@ -6,7 +6,6 @@
 --track@h:高さ(px),1,16384,200,1
 --track@line:線幅(px),0,2000,10,1
 --check@fill:塗りつぶし,true
---check@pick:プレビューから範囲指定,false
 --color@col:色,0xffffff
 
 obj.load("figure", "四角形", 0xffffff, 1)

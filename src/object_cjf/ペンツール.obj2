@@ -1,10 +1,14 @@
 --information:ペンツール（フリーハンド線・描画アニメーション） ver0.7
 --label:CJF
 
---check@progctl:進捗スライダーで制御,false
---track@prog:進捗(%),0,100,0,1
---check@pen:ペンモード起動,false
---check@clear:線をクリア,false
+--select@mode:進行モード,自動再生=0,進捗指定=1,秒数指定=2
+--track@dir:再生方向,-1,1,1,1
+--track@prog:進捗(%),0,100,0,0.1
+--track@dur:再生時間(秒),-600,600,5,0.1
+--hide@dir:mode~=0
+--hide@prog:mode~=1
+--hide@dur:mode~=2
+--separator:ペンの設定
 --track@w:ペンの太さ(px),1,2000,8,1
 --track@taper_in:入り長さ,0,50,0,1
 --track@taperw_in:入り太さ,0,100,0,1
@@ -223,18 +227,35 @@ local soft = clamp(tonumber(feather) or 2, 0.5, 2)
 local bw = math.max(4, math.ceil(maxX - minX + pw + 2 * soft + 4))
 local bh = math.max(4, math.ceil(maxY - minY + pw + 2 * soft + 4))
 
--- 進捗（0..1）: 線が引かれていく割合
--- 「進捗スライダーで制御」ON の場合は「進捗(%)」スライダーの値を使う。
---   スライダーを中間点で 0→100 に直線移動させると、その速度で線が伸びる。
---   固定値ならその割合で静止表示（スクラブも可能）。
--- それ以外（デフォルト）はクリップ長基準で自動的に 0→100 に移動:
---   obj.frame / obj.totalframe（オブジェクト基準のフレーム）を使う。
---   取れない環境では秒ベース（obj.time / obj.totaltime）へフォールバックし、
---   どちらも取れなければ全体表示にする。
-local progctl = (progctl == true) or (progctl == 1)
+-- 進捗（0..1）: 線が引かれていく割合。進行モード (mode) で動作が変わる:
+--   0=自動再生: クリップ長基準で自動的に 0→100 に移動（デフォルト）
+--     obj.frame / obj.totalframe（オブジェクト基準のフレーム）を使う。
+--     取れない環境では秒ベース（obj.time / obj.totaltime）へフォールバックし、
+--     どちらも取れなければ全体表示にする。
+--   1=進捗指定: 「進捗(%)」スライダーの値を使う（静止表示。スクラブも可能）。
+--     スライダーを中間点で 0→100 に直線移動させると、その速度で線が伸びる。
+--   2=秒数指定: オブジェクト開始から「再生時間(秒)」で 0→100 に進行し、
+--     以降は 100% の静止画として残る（obj.time / 再生時間(秒)）。
+--     再生時間がマイナスの場合は、完成状態(100%)から逆再生して
+--     |再生時間| 秒後に 0% まで戻り、以降は未描画のまま残る。
+local mode = tonumber(mode) or 0
+local dir = tonumber(dir) or 1
 local f
-if progctl then
+if mode == 1 then
   f = clamp((tonumber(prog) or 0) / 100, 0, 1)
+elseif mode == 2 then
+  local t = tonumber(obj.time)
+  local dur = tonumber(dur) or 0
+  if t and dur ~= 0 then
+    local span = math.abs(dur)
+    if dur > 0 then
+      f = clamp(t / span, 0, 1)      -- 順再生: 指定秒で 1 に達し、以降は 1 のまま（静止画）
+    else
+      f = clamp(1 - t / span, 0, 1)  -- 逆再生: 開始は完成(1)で、指定秒で 0 まで戻る
+    end
+  else
+    f = 1 -- 判別不能 → 全体を表示（動作確認しやすい）
+  end
 else
   local fr = tonumber(obj.frame)
   local tf = tonumber(obj.totalframe)
@@ -251,6 +272,12 @@ else
   else
     -- 先頭フレームでもわずかに線が見えるように +1（最後のフレームで全体）
     f = clamp((fr + 1) / tf, 0, 1)
+  end
+  -- 自動再生の再生方向 (dir): 1=順再生 / -1=逆再生（完成(1)から未描画(0)へ）/ 0=静止（進捗100%の静止画）
+  if dir == 0 then
+    f = 1
+  elseif dir < 0 then
+    f = 1 - f
   end
 end
 
