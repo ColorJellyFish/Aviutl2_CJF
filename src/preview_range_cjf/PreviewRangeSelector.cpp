@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "config2.h"
 #include "plugin2.h"
 #include "logger2.h"
 
@@ -36,6 +37,7 @@ COMMON_PLUGIN_TABLE common_plugin_table = {
 };
 
 static LOG_HANDLE* logger = nullptr;
+static CONFIG_HANDLE* config_handle = nullptr; // InitializeConfig で取得 (Alias パス用)
 static HWND host_window = nullptr;
 static HINSTANCE module_instance = nullptr;
 static EDIT_HANDLE* edit_handle = nullptr; // RegisterPlugin で取得、以後も有効 (SDK サンプル準拠)
@@ -48,45 +50,39 @@ static const wchar_t frame_class_name[] = L"CJFPreviewRangeFrame";
 static OBJECT_HANDLE ctx_menu_object = nullptr;
 
 static void request_range_select(); // 前方宣言 (RegisterPlugin のメニュー登録から呼ぶ)
-static void reset_pick_checkbox();  // 前方宣言 (begin_range_select の失敗パスから呼ぶ)
 
 // Phase 5 UI: ドッキング可能な専用パネル (register_window_client で登録)
 static HWND panel_window = nullptr;
 static const wchar_t panel_class_name[] = L"CJFPreviewRangePanel";
 #define IDC_RANGE_BUTTON 2001
 #define IDC_PEN_BUTTON 2002
-static const char range_object_alias[] = u8R"([Object]
-[Object.0]
-effect.name=図形ツール
-図形=1
-幅(px)=200
-高さ(px)=200
-線幅(px)=10
-塗りつぶし=1
-色=ffffff
-プレビューから範囲指定=0
-[Object.1]
-effect.name=標準描画
-X=0.00
-Y=0.00
-)";
+#define IDC_CLEAR_BUTTON 2003
+// パネル自動作成で読み込むエイリアスファイル (Alias\図形ツール@推奨.object)。
+static const wchar_t range_alias_file_name[] = L"Alias\\図形ツール@推奨.object";
+
+// アプリケーションデータフォルダ配下のエイリアスファイルを読み込む。
+// 読み込めない場合は空文字列を返す (呼び出し側でオブジェクト作成を中止)。
+static std::string load_alias_file(const wchar_t* rel_path) {
+    if (!config_handle || !config_handle->app_data_path) return {};
+    std::wstring path = config_handle->app_data_path;
+    if (!path.empty() && path.back() != L'\\') path += L'\\';
+    path += rel_path;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return {};
+    std::string s;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) s.append(buf, n);
+    fclose(fp);
+    return s;
+}
 static constexpr wchar_t pen_frame_class_name[] = L"CJFPreviewPenFrame";
 static constexpr wchar_t pen_panel_message_name[] = L"CJF.PreviewRangeSelector.Panel.Pen";
+static constexpr wchar_t pen_panel_clear_message_name[] = L"CJF.PreviewRangeSelector.Panel.PenClear";
+// ボタンフィルタ（CJFRangeSelectorButton.auf2）から範囲指定を依頼するメッセージ。
+static constexpr wchar_t panel_range_message_name[] = L"CJF.PreviewRangeSelector.Panel.Range";
 
-// チェックボタン式起動 (Phase 5): 設定ウィンドウの「プレビューから範囲指定」チェックを
-// ポーリングで検知する。200ms ごとに選択中オブジェクトのチェックを読み、ON なら起動。
-#define PICK_POLL_TIMER_ID 3
-#define PICK_POLL_INTERVAL_MS 200
-static bool pick_trigger_detected = false; // 検知→適用/キャンセルまで再検知を防ぐ
-static bool checkbox_polling_enabled = true;
-static bool polling_in_progress = false;
-static DWORD polling_backoff_until = 0;
-#define CONFIG_CHECKBOX_ID 3001
-static HWND config_window = nullptr;
-static constexpr COLORREF CJF_UI_BG = RGB(0x20, 0x20, 0x20);
-static constexpr COLORREF CJF_UI_BUTTON = RGB(0x2a, 0x2a, 0x2a);
-static constexpr COLORREF CJF_UI_BORDER = RGB(0x60, 0x60, 0x60);
-static constexpr COLORREF CJF_UI_TEXT = RGB(0xff, 0xff, 0xff);
+static constexpr COLORREF CJF_UI_BORDER = RGB(0x60, 0x60, 0x60); // パネルボタンの枠線
 #define CONFIRM_RETRY_TIMER_ID 4
 #define CONFIRM_RETRY_INTERVAL_MS 50
 #define CONFIRM_RETRY_MAX 20
@@ -109,177 +105,6 @@ static Mode mode = Mode::Idle;
 
 // レンダリング中の再入を防ぐ。
 static bool render_in_progress = false;
-
-// L-SMASH WorksはIndex作成中、lwinputダイアログを表示しながら自前の
-// メッセージポンプでホスト側メッセージもDispatchする。そこへ編集セクション
-// の読み取りを再入すると、入力処理中のロックと競合してデッドロックし得る。
-// lwinputのダイアログ表示中は、チェック監視を行わない。
-static bool is_lwinput_busy() {
-    return FindWindowW(nullptr, L"lwinput") != nullptr;
-}
-
-static std::wstring get_config_path() {
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(module_instance, path, MAX_PATH)) return {};
-    wchar_t* slash = wcsrchr(path, L'\\');
-    if (!slash) return {};
-    *(slash + 1) = L'\0';
-    return std::wstring(path) + L"CJFPreviewRangeSelector.ini";
-}
-
-static void load_settings() {
-    const std::wstring path = get_config_path();
-    if (!path.empty())
-        checkbox_polling_enabled = GetPrivateProfileIntW(
-            L"General", L"EnableCheckboxPolling", 1, path.c_str()) != 0;
-}
-
-static void save_settings() {
-    const std::wstring path = get_config_path();
-    if (!path.empty())
-        WritePrivateProfileStringW(
-            L"General", L"EnableCheckboxPolling",
-            checkbox_polling_enabled ? L"1" : L"0", path.c_str());
-}
-
-static void update_poll_timer() {
-    if (!frame_window) return;
-    if (checkbox_polling_enabled)
-        SetTimer(frame_window, PICK_POLL_TIMER_ID, PICK_POLL_INTERVAL_MS, nullptr);
-    else
-        KillTimer(frame_window, PICK_POLL_TIMER_ID);
-}
-
-static LRESULT CALLBACK config_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-    switch (message) {
-    case WM_CREATE: {
-        // BS_OWNERDRAW はボタン種別 (BS_TYPEMASK) を上書きするため、
-        // BS_AUTOCHECKBOX を併用してもチェック状態は保持されない
-        // (MSDN: BS_OWNERDRAW は他のボタンスタイルと併用しない)。
-        // 見た目は WM_DRAWITEM で描画し、状態は checkbox_polling_enabled で管理する。
-        CreateWindowExW(
-            0, L"BUTTON", L"チェックボックス式起動を有効にする",
-            WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-            16, 16, 300, 24, hwnd, reinterpret_cast<HMENU>(CONFIG_CHECKBOX_ID),
-            module_instance, nullptr);
-        CreateWindowExW(
-            0, L"BUTTON", L"閉じる", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
-            236, 52, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
-            module_instance, nullptr);
-        return 0;
-    }
-    case WM_ERASEBKGND: {
-        RECT rc = {};
-        GetClientRect(hwnd, &rc);
-        HBRUSH brush = CreateSolidBrush(CJF_UI_BG);
-        FillRect(reinterpret_cast<HDC>(wparam), &rc, brush);
-        DeleteObject(brush);
-        return 1;
-    }
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLORBTN: {
-        HDC dc = reinterpret_cast<HDC>(wparam);
-        SetTextColor(dc, CJF_UI_TEXT);
-        SetBkColor(dc, CJF_UI_BG);
-        static HBRUSH brush = CreateSolidBrush(CJF_UI_BG);
-        return reinterpret_cast<LRESULT>(brush);
-    }
-    case WM_DRAWITEM: {
-        LPDRAWITEMSTRUCT dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lparam);
-        if (dis->CtlID == CONFIG_CHECKBOX_ID) {
-            SetBkMode(dis->hDC, TRANSPARENT);
-            SetTextColor(dis->hDC, CJF_UI_TEXT);
-            RECT box = dis->rcItem;
-            box.right = box.left + 16;
-            box.bottom = box.top + 16;
-            HBRUSH bg = CreateSolidBrush(CJF_UI_BG);
-            FillRect(dis->hDC, &box, bg);
-            DeleteObject(bg);
-            HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
-            FrameRect(dis->hDC, &box, border);
-            DeleteObject(border);
-            if (checkbox_polling_enabled) {
-                HPEN pen = CreatePen(PS_SOLID, 2, CJF_UI_TEXT);
-                HGDIOBJ old_pen = SelectObject(dis->hDC, pen);
-                MoveToEx(dis->hDC, box.left + 3, box.top + 8, nullptr);
-                LineTo(dis->hDC, box.left + 7, box.bottom - 3);
-                LineTo(dis->hDC, box.right - 3, box.top + 3);
-                SelectObject(dis->hDC, old_pen);
-                DeleteObject(pen);
-            }
-            RECT text = dis->rcItem;
-            text.left += 24;
-            DrawTextW(dis->hDC, L"チェックボックス式起動を有効にする", -1, &text,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            return TRUE;
-        }
-        if (dis->CtlID != IDCANCEL) break;
-        HBRUSH brush = CreateSolidBrush(
-            (dis->itemState & ODS_SELECTED) ? CJF_UI_BG : CJF_UI_BUTTON);
-        FillRect(dis->hDC, &dis->rcItem, brush);
-        DeleteObject(brush);
-        SetBkMode(dis->hDC, TRANSPARENT);
-        SetTextColor(dis->hDC, CJF_UI_TEXT);
-        DrawTextW(dis->hDC, L"閉じる", -1, &dis->rcItem,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        HBRUSH border = CreateSolidBrush(CJF_UI_BORDER);
-        FrameRect(dis->hDC, &dis->rcItem, border);
-        DeleteObject(border);
-        return TRUE;
-    }
-    case WM_COMMAND:
-        if (LOWORD(wparam) == CONFIG_CHECKBOX_ID && HIWORD(wparam) == BN_CLICKED) {
-            // BS_OWNERDRAW 種別のボタンにはチェック状態が無い (BM_GETCHECK 常に0)。
-            // 状態は checkbox_polling_enabled で自前管理し、クリックで反転する。
-            checkbox_polling_enabled = !checkbox_polling_enabled;
-            save_settings();
-            update_poll_timer();
-            InvalidateRect(GetDlgItem(hwnd, CONFIG_CHECKBOX_ID), nullptr, TRUE);
-            return 0;
-        }
-        if (LOWORD(wparam) == IDCANCEL) {
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        break;
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-    case WM_DESTROY:
-        config_window = nullptr;
-        return 0;
-    }
-    return DefWindowProcW(hwnd, message, wparam, lparam);
-}
-
-static void open_config_window(HWND owner, HINSTANCE dll_hinst) {
-    if (config_window && IsWindow(config_window)) {
-        ShowWindow(config_window, SW_SHOWNORMAL);
-        SetForegroundWindow(config_window);
-        return;
-    }
-    static bool class_registered = false;
-    if (!class_registered) {
-        WNDCLASSEXW wc = {};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = config_wnd_proc;
-        wc.hInstance = dll_hinst ? dll_hinst : module_instance;
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-        wc.lpszClassName = L"CJFPreviewRangeConfig";
-        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
-        class_registered = true;
-    }
-    config_window = CreateWindowExW(
-        WS_EX_DLGMODALFRAME, L"CJFPreviewRangeConfig", L"CJF 範囲指定の設定",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 340, 125,
-        owner, nullptr, dll_hinst ? dll_hinst : module_instance, nullptr);
-    if (config_window) {
-        ShowWindow(config_window, SW_SHOWNORMAL);
-        UpdateWindow(config_window);
-    }
-}
 
 static bool dragging = false;
 static POINT drag_start = { 0, 0 };
@@ -518,7 +343,6 @@ static void hide_frame() {
     }
     mode = Mode::Idle;
     dragging = false; // WM_CAPTURECHANGED での二重キャンセル防止 (先にクリア)
-    pick_trigger_detected = false; // チェックポーリングの再検知を許可
     if (GetCapture() == frame_window) ReleaseCapture();
     if (host_window && IsWindow(host_window)) SetFocus(host_window);
 }
@@ -528,10 +352,6 @@ static void finish_range_select(RenderCtx* ctx) {
     if (!ctx->copied) {
         frame_rgba.clear();
         render_in_progress = false;
-        if (pick_trigger_detected) {
-            pick_trigger_detected = false;
-            reset_pick_checkbox();
-        }
         delete ctx;
         return;
     }
@@ -573,10 +393,6 @@ static void begin_range_select() {
     if (info.width < 1 || info.height < 1) {
         render_in_progress = false;
         // チェック経由の起動失敗時のみチェックを OFF に戻す (他経路では書込まない)
-        if (pick_trigger_detected) {
-            pick_trigger_detected = false;
-            reset_pick_checkbox();
-        }
         if (logger) logger->warn(logger, L"[CJF RangeSelector] no scene (invalid size), range select aborted");
         return;
     }
@@ -593,10 +409,6 @@ static void begin_range_select() {
     if (!render_current_frame(info.frame, frame_rgba.data(), info.width, info.height)) {
         frame_rgba.clear();
         render_in_progress = false;
-        if (pick_trigger_detected) {
-            pick_trigger_detected = false;
-            reset_pick_checkbox();
-        }
         return;
     }
     // 完了後の表示処理はWM_CJF_RENDER_COMPLETEから続行する。
@@ -608,10 +420,6 @@ static void begin_range_select() {
         frame_rgba.clear();
         render_in_progress = false;
         // チェック経由の起動失敗時のみチェックを OFF に戻す (他経路では書込まない)
-        if (pick_trigger_detected) {
-            pick_trigger_detected = false;
-            reset_pick_checkbox();
-        }
         if (logger) {
             wchar_t m[256] = {};
             swprintf_s(m, L"[CJF RangeSelector] rendering_scene_video failed (frame=%d, %lu ms). Output in progress?", info.frame, render_ms);
@@ -664,42 +472,8 @@ static void begin_range_select() {
 #endif
 }
 
-// チェックボタン式起動: 選択中オブジェクトの「プレビューから範囲指定」チェックを OFF に戻す。
-// キャンセル時 (Esc) に呼ぶ。適用時は apply 側で座標・大きさと同じ編集セクションで OFF にする。
-static void reset_pick_checkbox() {
-    if (!edit_handle) return;
-    edit_handle->call_edit_section_param(nullptr, [](void*, EDIT_SECTION* edit) {
-        // チェック OFF はエイリアスファイルと同じ "0"/"1" 形式で書く
-        // (SDK 仕様: set_object_item_value の value はエイリアスファイルの設定値と
-        //  同じフォーマット。alias ダンプでは 塗りつぶし=0 のように数値で保存される)。
-        // 現在値が ON ("1") のオブジェクトだけ OFF に書く (OFF のままのオブジェクトに
-        // 無意味な Undo エントリを積まない)。
-        int n = edit->get_selected_object_num();
-        for (int i = 0; i < n; ++i) {
-            OBJECT_HANDLE obj = edit->get_selected_object(i);
-            if (!obj) continue;
-            if (edit->count_object_effect(obj, L"図形ツール") <= 0) continue;
-            const char* v = edit->get_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定");
-            if (v && v[0] == '1') {
-                edit->set_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定", "0");
-            }
-        }
-        // フォーカスオブジェクトも対象にする
-        OBJECT_HANDLE obj = edit->get_focus_object();
-        if (obj && edit->count_object_effect(obj, L"図形ツール") > 0) {
-            const char* v = edit->get_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定");
-            if (v && v[0] == '1') {
-                edit->set_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定", "0");
-            }
-        }
-    });
-}
-
 static void cancel_range_select() {
     if (logger) logger->log(logger, L"[CJF RangeSelector] canceled (Esc)");
-    // チェック経由で起動した場合のみチェックを OFF に戻す。
-    // 他の経路 (メニュー/パネル) では書き込まず、余計な Undo を積まない。
-    if (pick_trigger_detected) reset_pick_checkbox();
     hide_frame();
 }
 
@@ -711,7 +485,6 @@ struct ApplyResultCtx {
     RangeSelectResult result;
     OBJECT_HANDLE candidates[32]; // 適用対象候補 (ステップ0で収集し各ステップで使う)
     int candidate_num;            // 候補数
-    int pick_was_on;              // チェック「プレビューから範囲指定」が ON の候補があったか
     int applied;  // 更新できた図形ツールエフェクト数
     int checked;  // 図形ツールとして識別できたエフェクト数
     int selected; // 選択中オブジェクト数 (診断用)
@@ -761,50 +534,14 @@ static void collect_apply_candidates(ApplyResultCtx* ctx, EDIT_SECTION* edit) {
     }
 }
 
-// 適用ステップ0 (読み取り・Undo なし): 候補オブジェクトを収集し、チェック
-// 「プレビューから範囲指定」が ON の候補があるかを事前確認する。編集セクション
-// (Undo) を開かずに済むため、チェック OFF 経路以外 (メニュー/パネル/右クリック) で
+// 適用ステップ0 (読み取り・Undo なし): 候補オブジェクトを収集する。
+// 編集セクション (Undo) を開かずに済むため、メニュー/パネル/右クリック起動で
 // 空の Undo エントリが積まれない。
 static void apply_scan_edit(void* param, EDIT_SECTION* edit) {
     ApplyResultCtx* ctx = static_cast<ApplyResultCtx*>(param);
     __try {
         ctx->crash_stage = 1;
         collect_apply_candidates(ctx, edit);
-        ctx->crash_stage = 4;
-        for (int ci = 0; ci < ctx->candidate_num; ++ci) {
-            OBJECT_HANDLE obj = ctx->candidates[ci];
-            if (edit->count_object_effect(obj, L"図形ツール") <= 0) continue;
-            const char* v = edit->get_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定");
-            if (v && v[0] == '1') {
-                ctx->pick_was_on = 1;
-                break;
-            }
-        }
-        ctx->crash_stage = 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ctx->crashed = 1;
-    }
-}
-
-// 適用ステップ1 (Undo エントリ 1): チェック「プレビューから範囲指定」を OFF に戻す。
-// 座標・大きさの書込 (ステップ2) とは別の編集セクションで書くことで、Undo 1 回では
-// 座標・大きさだけが戻り、チェックは OFF のままになる (ON に戻されて範囲指定が
-// 再起動するのを防ぐ)。
-// ※ SDK 仕様: call_edit_section_param のコールバック内で編集した内容は 1 つに
-//    まとめられて Undo に登録される (編集セクションごとに Undo エントリが 1 つ)。
-// 現在値 (alias 形式 "0"/"1") が ON のオブジェクトだけ OFF に書く (無意味な Undo を積まない)。
-static void apply_pick_reset_edit(void* param, EDIT_SECTION* edit) {
-    ApplyResultCtx* ctx = static_cast<ApplyResultCtx*>(param);
-    __try {
-        ctx->crash_stage = 4;
-        for (int ci = 0; ci < ctx->candidate_num; ++ci) {
-            OBJECT_HANDLE obj = ctx->candidates[ci];
-            if (edit->count_object_effect(obj, L"図形ツール") <= 0) continue;
-            const char* v = edit->get_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定");
-            if (v && v[0] == '1') {
-                edit->set_object_item_value(obj, L"図形ツール", L"プレビューから範囲指定", "0");
-            }
-        }
         ctx->crash_stage = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         ctx->crashed = 1;
@@ -938,15 +675,9 @@ static bool apply_result_to_shape_tools() {
 
     }
 
-    // 適用は「読み取りスキャン → 編集セクション 2 つ」の構成にする:
-    //   ステップ0 (読み取り・Undo なし): 候補収集 + チェック ON の有無を事前確認
-    //   ステップ1 (編集・Undo エントリ 1): チェック「プレビューから範囲指定」OFF
-    //   ステップ2 (編集・Undo エントリ 2): 幅/高さ + 標準設定 X/Y
-    // ステップ1 と 2 を別の編集セクションにすることで、Undo 1 回ではステップ2
-    // (座標・大きさ) だけが戻り、チェックは OFF のままになる (ON に戻って範囲指定が
-    // 再起動するのを防ぐ)。
-    // ※ SDK 仕様: call_edit_section_param のコールバック内の編集は 1 つの Undo にまとめられる。
-    // ステップ1 はチェックが ON の候補があるときだけ実行する (空の Undo エントリを積まない)。
+    // 適用は「読み取りスキャン → 編集セクション」の構成にする:
+    //   ステップ0 (読み取り・Undo なし): 候補収集
+    //   ステップ1 (編集・Undo エントリ 1): 幅/高さ + 標準設定 X/Y
     // 戻り値: true なら成功 / 編集できない場合(出力中など)は失敗しコールバックは呼ばれない
     if (!edit_handle->call_read_section_param(&ctx, apply_scan_edit)) {
         log_apply_section_failed(L"could not enter read section (playback/output in progress?)", clamped.width, clamped.height);
@@ -955,17 +686,6 @@ static bool apply_result_to_shape_tools() {
     if (ctx.crashed) {
         log_apply_crashed(ctx, clamped.width, clamped.height);
         return false;
-    }
-    if (ctx.pick_was_on) {
-        if (!edit_handle->call_edit_section_param(&ctx, apply_pick_reset_edit)) {
-            log_apply_section_failed(L"could not enter edit section (playback/output in progress?)", clamped.width, clamped.height);
-            return false;
-        }
-        // ステップ1 がクラッシュした場合は座標書込 (ステップ2) をスキップ
-        if (ctx.crashed) {
-            log_apply_crashed(ctx, clamped.width, clamped.height);
-            return false;
-        }
     }
     if (!edit_handle->call_edit_section_param(&ctx, apply_coords_edit)) {
         log_apply_section_failed(L"could not enter edit section for coords (playback/output in progress?)", clamped.width, clamped.height);
@@ -1049,81 +769,24 @@ static void request_range_select() {
     if (frame_window) PostMessageW(frame_window, WM_APP + 1, 0, 0);
 }
 
-// チェックボタン式起動のポーリング: 選択中オブジェクトの 図形ツール 効果に
-// 「プレビューから範囲指定」チェック (項目名=表示名) が入っているかを確認する。
-// ON を検知したら範囲指定を起動する (チェックの OFF への戻しは適用/キャンセル時に行う)。
-static void poll_pick_trigger() {
-    if (!edit_handle || !frame_window || pick_trigger_detected) return;
-    if (mode != Mode::Idle || render_in_progress) return;
-    if (!checkbox_polling_enabled || polling_in_progress) return;
-    if (is_lwinput_busy()) return;
-    if (GetCapture() != nullptr) return;
-    if (static_cast<LONG>(GetTickCount() - polling_backoff_until) < 0) return;
-    if (edit_handle->get_edit_state() != EDIT_HANDLE::EDIT_STATE_EDIT) return;
-    polling_in_progress = true;
-    struct PollGuard { bool& active; ~PollGuard() { active = false; } } guard{ polling_in_progress };
-
-    // チェックボックスはセクション単位のため、現在フレームの値を読む。
-    // frame=0 を渡すと 0 フレーム時点の値になり、後ろのフレームで ON にした
-    // チェックを検知できない (SDK 仕様: get_object_check_value の frame は
-    // 「取得対象のフレーム番号 ※セクション毎チェックボックスの場合に利用」)。
-    EDIT_INFO info = {};
-    edit_handle->get_edit_info(&info, sizeof(info));
-
-    struct PickCtx {
-        int found;
-        int frame;
-    } pick = { 0, info.frame };
-
-    // 読み取りセクションで選択中オブジェクトを確認 (編集ロックを取らない軽い読み取り)
-    if (!edit_handle->call_read_section_param(&pick, [](void* param, EDIT_SECTION* edit) {
-        PickCtx* p = static_cast<PickCtx*>(param);
-        int n = edit->get_selected_object_num();
-        for (int i = 0; i < n && !p->found; ++i) {
-            OBJECT_HANDLE obj = edit->get_selected_object(i);
-            if (!obj) continue;
-            // 図形ツール 効果があるか (count で判定)
-            if (edit->count_object_effect(obj, L"図形ツール") <= 0) continue;
-            // チェック項目「プレビューから範囲指定」が現在フレームで ON か
-            bool on = false;
-            if (edit->get_object_check_value(obj, L"図形ツール", L"プレビューから範囲指定", p->frame, &on) && on) {
-                p->found = 1;
-            }
-        }
-        // フォーカスオブジェクト (オブジェクト設定ウィンドウの対象) も確認。
-        // 設定ウィンドウを開いている対象が選択リストに入っていない場合があるため。
-        if (!p->found) {
-            OBJECT_HANDLE obj = edit->get_focus_object();
-            if (obj && edit->count_object_effect(obj, L"図形ツール") > 0) {
-                bool on = false;
-                if (edit->get_object_check_value(obj, L"図形ツール", L"プレビューから範囲指定", p->frame, &on) && on) {
-                    p->found = 1;
-                }
-            }
-        }
-    })) {
-        // 一時的に編集側が別の処理中なら、次の数回を飛ばして競合を拡大しない。
-        polling_backoff_until = GetTickCount() + 500;
-        return;
-    }
-
-    if (pick.found) {
-        pick_trigger_detected = true; // 適用/キャンセルまで再検知しない
-        if (logger) logger->log(logger, L"[CJF RangeSelector] pick checkbox ON detected, starting range select");
-        request_range_select();
-    }
-}
-
 // パネル起動時の対象解決。該当オブジェクトが無ければ、現在フレームから
 // 3 秒分の図形ツールを空きレイヤーへ作成し、そのハンドルを適用対象にする。
 static bool prepare_panel_range_target() {
     if (!edit_handle) return false;
     EDIT_INFO info = {};
     edit_handle->get_edit_info(&info, sizeof(info));
+    // エイリアスファイルからオブジェクト定義を読む（.object が正規の定義）。
+    std::string alias = load_alias_file(range_alias_file_name);
+    if (alias.empty()) {
+        if (logger) logger->warn(logger,
+            L"[CJF RangeSelector] alias file not found: Alias\\図形ツール@推奨.object");
+        return false;
+    }
     struct PanelCtx {
         EDIT_INFO info;
         OBJECT_HANDLE target;
-    } ctx = { info, nullptr };
+        const char* alias; // エイリアスデータ (呼び出し側で保持)
+    } ctx = { info, nullptr, alias.c_str() };
     if (!edit_handle->call_edit_section_param(&ctx, [](void* param, EDIT_SECTION* edit) {
         PanelCtx* p = static_cast<PanelCtx*>(param);
         auto is_target = [](EDIT_SECTION* ed, OBJECT_HANDLE obj) {
@@ -1142,13 +805,26 @@ static bool prepare_panel_range_target() {
 
         int fps = p->info.scale > 0 ? p->info.rate / p->info.scale : p->info.rate;
         int length = std::max(1, static_cast<int>(std::lround(3.0 * std::max(1, fps))));
+        // 空きレイヤー探索。
+        // layer_max は「オブジェクトが存在する最大のレイヤー番号」であり
+        // 総レイヤー数ではないため、剰余による折り返しは使えない
+        // （埋まっている範囲内を周回して空きレイヤーへ到達できない）。
+        // 現在レイヤーから上方向へ、レイヤーが存在しなくなる（create が
+        // 失敗する）まで探索し、見つからなければ下方向（0 まで）も試す。
         int first = std::max(0, p->info.layer);
-        for (int pass = 0; pass <= p->info.layer_max && !p->target; ++pass) {
-            int layer = (first + pass) % std::max(1, p->info.layer_max + 1);
-            if (edit->find_object(layer, p->info.frame)) continue;
+        auto try_create = [&](int layer) {
             p->target = edit->create_object_from_alias(
-                range_object_alias, layer, p->info.frame, length);
+                p->alias, layer, p->info.frame, length);
             if (p->target) edit->set_focus_object(p->target);
+        };
+        for (int layer = first; !p->target && layer < first + 4096; ++layer) {
+            if (edit->find_object(layer, p->info.frame)) continue; // 埋まっている
+            try_create(layer);
+            if (!p->target) break; // create 失敗 = レイヤーが存在しない → 上方向は終了
+        }
+        for (int layer = first - 1; layer >= 0 && !p->target; --layer) {
+            if (edit->find_object(layer, p->info.frame)) continue;
+            try_create(layer);
         }
     })) {
         return false;
@@ -1184,17 +860,30 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
             SetFocus(nullptr); // ボタンのフォーカスを外す (サンプル準拠)
             return 0;
         }
+        if (LOWORD(wparam) == IDC_CLEAR_BUTTON) {
+            // パネル「クリア」: 選択中のペンツールの線をクリアする。
+            // オブジェクト生成は行わない（対象解決は PenTool 側で選択中→フォーカスのみ）。
+            HWND pen_window = FindWindowW(pen_frame_class_name, nullptr);
+            if (pen_window) {
+                UINT message_id = RegisterWindowMessageW(pen_panel_clear_message_name);
+                PostMessageW(pen_window, message_id, 0, 0);
+            }
+            SetFocus(nullptr);
+            return 0;
+        }
         break;
     }
     case WM_SIZE: {
-        // パネルのリサイズに合わせてボタンをフィットさせる
+        // パネルのリサイズに合わせてボタンをフィットさせる (矩形/ペン/クリアの3分割)
         RECT rc = {};
         GetClientRect(hwnd, &rc);
-        int width = static_cast<int>(std::max<LONG>(1, (rc.right - rc.left) / 2));
+        int width = static_cast<int>(std::max<LONG>(1, (rc.right - rc.left) / 3));
         HWND range_btn = GetDlgItem(hwnd, IDC_RANGE_BUTTON);
         HWND pen_btn = GetDlgItem(hwnd, IDC_PEN_BUTTON);
+        HWND clear_btn = GetDlgItem(hwnd, IDC_CLEAR_BUTTON);
         if (range_btn) MoveWindow(range_btn, 0, 0, width, rc.bottom, TRUE);
-        if (pen_btn) MoveWindow(pen_btn, width, 0, rc.right - width, rc.bottom, TRUE);
+        if (pen_btn) MoveWindow(pen_btn, width, 0, width, rc.bottom, TRUE);
+        if (clear_btn) MoveWindow(clear_btn, width * 2, 0, rc.right - width * 2, rc.bottom, TRUE);
         return 0;
     }
     case WM_ERASEBKGND: {
@@ -1210,7 +899,7 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         // オーナードローされたパネルボタンの描画
         LPDRAWITEMSTRUCT dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lparam);
         if (dis->CtlType != ODT_BUTTON ||
-            (dis->CtlID != IDC_RANGE_BUTTON && dis->CtlID != IDC_PEN_BUTTON)) break;
+            (dis->CtlID != IDC_RANGE_BUTTON && dis->CtlID != IDC_PEN_BUTTON && dis->CtlID != IDC_CLEAR_BUTTON)) break;
         HDC dc = dis->hDC;
         RECT rc = dis->rcItem;
         COLORREF bg = PANEL_BG_COLOR;
@@ -1225,7 +914,10 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, PANEL_TEXT_COLOR);
         HGDIOBJ old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-        LPCWSTR label = dis->CtlID == IDC_PEN_BUTTON ? L"ペン" : L"矩形";
+        LPCWSTR label = L"";
+        if (dis->CtlID == IDC_PEN_BUTTON) label = L"ペン";
+        else if (dis->CtlID == IDC_RANGE_BUTTON) label = L"矩形";
+        else if (dis->CtlID == IDC_CLEAR_BUTTON) label = L"クリア";
         DrawTextW(dc, label, -1, &rc,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, old_font);
@@ -1237,13 +929,17 @@ static LRESULT CALLBACK panel_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
 }
 
 static LRESULT CALLBACK frame_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    // ボタンフィルタ（CJFRangeSelectorButton）からの範囲指定依頼。
+    // パネル「矩形」ボタンと同じく、対象が無ければ自動作成してから開始する。
+    static UINT panel_range_message = RegisterWindowMessageW(panel_range_message_name);
+    if (message == panel_range_message) {
+        if (prepare_panel_range_target()) request_range_select();
+        return 0;
+    }
     switch (message) {
     case WM_TIMER: {
         if (wparam == 2 && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) {
             cancel_range_select();
-        }
-        if (wparam == PICK_POLL_TIMER_ID) {
-            poll_pick_trigger();
         }
         if (wparam == CONFIRM_RETRY_TIMER_ID) {
             retry_range_confirm();
@@ -1314,7 +1010,6 @@ static LRESULT CALLBACK frame_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, L
         // Phase 4: 選択中の CJF 図形ツールオブジェクトへ W/H を反映
         if (!apply_result_to_shape_tools()) {
             // 最初の編集セクションだけ成功した場合があるため、UIイベントを返してから再試行する。
-            // これによりチェックOFF→座標書込の段階差をユーザー操作で吸収しない。
             confirm_retry_count = 0;
             SetTimer(frame_window, CONFIRM_RETRY_TIMER_ID, CONFIRM_RETRY_INTERVAL_MS, nullptr);
             return 0;
@@ -1356,13 +1051,18 @@ EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* handle) {
     // logger = handle;
 }
 
+// アプリケーションデータフォルダのパス取得（エイリアスファイル読み込み用）。
+// InitializePlugin() より前に呼ばれる。
+EXTERN_C __declspec(dllexport) void InitializeConfig(CONFIG_HANDLE* config) {
+    config_handle = config;
+}
+
 EXTERN_C __declspec(dllexport) bool InitializePlugin(DWORD version) {
     return version >= RequiredVersion();
 }
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
     if (frame_window) {
-        KillTimer(frame_window, PICK_POLL_TIMER_ID);
         DestroyWindow(frame_window);
         frame_window = nullptr;
     }
@@ -1414,22 +1114,20 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
         host_window, nullptr, module_instance, nullptr);
     if (!frame_window) return;
 
-    load_settings();
-    // チェックボタン式起動のポーリングタイマー (常時動作。検知は Idle 時のみ)
-    update_poll_timer();
-
     // 編集セクションを渡さないメニュー登録 (_param 版): 参照ロック状態で呼ばれないようにする。
     // さらに処理は PostMessage で遅延し、wait_rendering_task のデッドロックを確実に回避する。
     host->register_edit_menu_param(L"CJF\\プレビューから範囲指定", nullptr, [](void*) {
         request_range_select();
     });
-    host->register_config_menu(L"CJF\\範囲指定", open_config_window);
 
     // Phase 5 UI (A): オブジェクト設定ウィンドウの右クリックメニューに登録。
     // コールバックに OBJECT_HANDLE が直接渡るため、対象オブジェクトを保存して
     // 範囲指定の適用時に選択状態へ依存しない。
+    // ※ SDK の登録 API に表示フィルタは無く、メニューは全オブジェクトに表示される。
+    //    誤動作防止のため 図形ツール 効果以外では何もしない。
     host->register_object_item_menu_param(
         L"プレビューから範囲指定", true, nullptr, [](void*, OBJECT_HANDLE object, LPCWSTR effect, LPCWSTR item) {
+            if (!effect || wcscmp(effect, L"図形ツール") != 0) return;
             ctx_menu_object = object;
             if (logger) {
                 wchar_t m[256] = {};
@@ -1450,12 +1148,12 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
     if (RegisterClassExW(&pwc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
         panel_window = CreateWindowExW(
             0, panel_class_name, L"CJF ツール", WS_POPUP,
-            CW_USEDEFAULT, CW_USEDEFAULT, 220, 40,
+            CW_USEDEFAULT, CW_USEDEFAULT, 330, 40,
             nullptr, nullptr, module_instance, nullptr);
         if (panel_window) {
             // パネルいっぱいのボタン
             CreateWindowExW(
-            0, L"BUTTON", L"矩形",
+            0, L"BUTTON", L"図形",
                 WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                 0, 0, 110, 40,
                 panel_window, reinterpret_cast<HMENU>(IDC_RANGE_BUTTON), module_instance, nullptr);
@@ -1464,6 +1162,11 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
                 WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
                 110, 0, 110, 40,
                 panel_window, reinterpret_cast<HMENU>(IDC_PEN_BUTTON), module_instance, nullptr);
+            CreateWindowExW(
+                0, L"BUTTON", L"クリア",
+                WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+                220, 0, 110, 40,
+                panel_window, reinterpret_cast<HMENU>(IDC_CLEAR_BUTTON), module_instance, nullptr);
             host->register_window_client(L"CJF ツール", panel_window);
         }
     }
